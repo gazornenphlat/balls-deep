@@ -1,0 +1,8 @@
+{
+  "appId": "com.yourteam.ballsdeep",
+  "appName": "Balls Deep",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}
