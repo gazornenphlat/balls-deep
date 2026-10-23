@@ -11,6 +11,20 @@ Data is saved locally in whichever browser (or Android WebView) you run it
 in. It does **not** sync with the version inside your Claude conversation —
 they're separate copies of the app with separate saved data.
 
+## Screenshots
+
+| Roster | Positions |
+|--------|-----------|
+| ![Roster](screenshots/01-roster.png) | ![Positions](screenshots/02-positions.png) |
+
+| Live game | Game list |
+|-----------|-----------|
+| ![Live game](screenshots/03-gameday.png) | ![Game list](screenshots/05-gameday-list.png) |
+
+| History |
+|---------|
+| ![History](screenshots/04-history.png) |
+
 ## Run it locally (Mac/Windows/Linux)
 
 **Prerequisite:** [Node.js](https://nodejs.org) 18 or newer. Check with
