@@ -13,7 +13,7 @@ USA football roster and live playtime manager for coaches. React + Vite web app,
 - `src/App.jsx` is the **entire app** (about 1,900 lines): no router, no state library, no backend.
 - `src/App.jsx` must stay identical to the standalone artifact file `balls-deep.jsx`. Edit one, copy to the other.
 - `src/main.jsx`, `src/index.css`, Tailwind 3, `lucide-react` icons.
-- `capacitor.config.json`: appId `com.yourteam.ballsdeep`, appName "Balls Deep", webDir `dist`.
+- `capacitor.config.json`: appId `com.lusciouswang.ballsdeep`, appName "Balls Deep", webDir `dist`.
 
 ## Data model
 Everything is one JSON blob under storage key `app-data`, read and written through the `storage` adapter (`window.storage` in the Claude artifact, `localStorage` standalone).
