@@ -30,4 +30,4 @@ Roster + CSV import/export, per-game active toggles, positions and weights, star
 - Whole-app JSON export/import for backup and moving between devices.
 - Play-count or per-quarter playtime balancing targets.
 - Persist report HTML to a file via Capacitor Filesystem/Share on Android.
-- Replace placeholder appId `com.yourteam.ballsdeep` before publishing.
+- appId set to `com.lusciouswang.ballsdeep`.
