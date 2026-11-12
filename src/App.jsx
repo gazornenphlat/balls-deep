@@ -21,6 +21,8 @@ import {
      clock: { running: bool, accumulatedSeconds: number, startedAt: ms|null }
    }]
    All data is combined into a single storage key so saves stay atomic.
+   The saved blob also carries `version` (DATA_VERSION). A backup file is the
+   same blob plus `app` and `exportedAt`.
    The live clock is never written every tick — only on start/pause/sub/end,
    with elapsed time between events computed from timestamps on render.
 
@@ -521,6 +523,120 @@ function rankCandidates(game, players, unit, positionName, now) {
   return scored;
 }
 
+/* ---------------------------- Saved data & backups ---------------------------- */
+
+/* Bump DATA_VERSION when the saved shape changes in a way old code can't
+   read, and add the matching upgrade step to normalizeAppData. */
+const DATA_VERSION = 1;
+const BACKUP_APP_ID = "balls-deep";
+
+/* Turns whatever was saved (any older version) into the current shape.
+   Used for both the normal load path and restoring a backup. */
+function normalizeAppData(parsed) {
+  const listOr = (list, fallback) => (Array.isArray(list) && list.length ? list : fallback);
+  return {
+    players: Array.isArray(parsed.players) ? parsed.players : [],
+    offensePositions: listOr(parsed.offensePositions, DEFAULT_OFFENSE_POSITIONS),
+    defensePositions: listOr(parsed.defensePositions, DEFAULT_DEFENSE_POSITIONS),
+    kickoffPositions: listOr(parsed.kickoffPositions, DEFAULT_KICKOFF_POSITIONS),
+    puntPositions: listOr(parsed.puntPositions, DEFAULT_PUNT_POSITIONS),
+    games: (Array.isArray(parsed.games) ? parsed.games : []).map((g) => ({
+      // Backfill fields for games saved before kickoff/punt, quarter-clock,
+      // substitution-log, possession-tracking, or final-score support existed.
+      quarterMinutes: 10,
+      quarterStartElapsed: 0,
+      currentUnit: "offense",
+      kickoffLineup: emptyLineup(DEFAULT_KICKOFF_POSITIONS),
+      puntLineup: emptyLineup(DEFAULT_PUNT_POSITIONS),
+      subLog: [],
+      possessionLog: [],
+      currentSessionStart: 0,
+      score: null,
+      ...g,
+    })),
+  };
+}
+
+function buildBackupJSON(state, now) {
+  return JSON.stringify({
+    app: BACKUP_APP_ID,
+    version: DATA_VERSION,
+    exportedAt: new Date(now).toISOString(),
+    players: state.players,
+    offensePositions: state.offensePositions,
+    defensePositions: state.defensePositions,
+    kickoffPositions: state.kickoffPositions,
+    puntPositions: state.puntPositions,
+    games: state.games,
+  });
+}
+
+/* Checks a backup thoroughly before anything is replaced: a file that passes
+   here must not be able to crash the app once loaded.
+   Returns { data, playerCount, gameCount, exportedAt } or { error }. */
+function parseBackupJSON(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return { error: "There's nothing to restore — the backup is empty." };
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    return { error: "That isn't a readable backup. If you pasted it, make sure you copied the whole thing." };
+  }
+  const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+  const notBackup = { error: "That isn't a Balls Deep backup." };
+  if (!isObj(parsed)) return notBackup;
+  if (parsed.app !== undefined && parsed.app !== BACKUP_APP_ID) return notBackup;
+  if (!Array.isArray(parsed.players) || !Array.isArray(parsed.games)) return notBackup;
+  if (parsed.version !== undefined && (typeof parsed.version !== "number" || parsed.version > DATA_VERSION)) {
+    return { error: "This backup was made by a newer version of the app. Update the app, then restore it." };
+  }
+
+  const damaged = (what) => ({ error: `This backup is damaged (${what}), so nothing was changed.` });
+  const unitIds = UNIT_DEFS.map((u) => u.id);
+  const uniqueIds = (list) => new Set(list.map((x) => x.id)).size === list.length;
+
+  const playerOk = (p) =>
+    isObj(p) && typeof p.id === "string" && !!p.id && typeof p.name === "string" &&
+    (p.number === undefined || p.number === null || typeof p.number === "string") &&
+    (p.positions === undefined || (Array.isArray(p.positions) && p.positions.every((pp) =>
+      isObj(pp) && unitIds.includes(pp.unit) && typeof pp.position === "string" && typeof pp.weight === "number")));
+  if (!parsed.players.every(playerOk) || !uniqueIds(parsed.players)) return damaged("player list");
+
+  const positionListOk = (list) =>
+    list === undefined || (Array.isArray(list) && list.every((pd) =>
+      isObj(pd) && typeof pd.name === "string" && !!pd.name && Number.isInteger(pd.slots) && pd.slots >= 1));
+  if (!["offensePositions", "defensePositions", "kickoffPositions", "puntPositions"].every((k) => positionListOk(parsed[k]))) {
+    return damaged("position settings");
+  }
+
+  const idOrNull = (v) => v === null || typeof v === "string";
+  const lineupOk = (l) => isObj(l) && Object.values(l).every((ids) => Array.isArray(ids) && ids.every(idOrNull));
+  const optional = (v, test) => v === undefined || test(v);
+  const num = (v) => typeof v === "number" && Number.isFinite(v);
+  const gameOk = (g) =>
+    isObj(g) && typeof g.id === "string" && !!g.id &&
+    ["setup", "live", "ended"].includes(g.status) &&
+    Array.isArray(g.activePlayerIds) && g.activePlayerIds.every((id) => typeof id === "string") &&
+    lineupOk(g.offenseLineup) && lineupOk(g.defenseLineup) &&
+    optional(g.kickoffLineup, lineupOk) && optional(g.puntLineup, lineupOk) &&
+    optional(g.currentUnit, (u) => unitIds.includes(u)) &&
+    isObj(g.playerStats) && Object.values(g.playerStats).every((s) =>
+      isObj(s) && num(s.secondsPlayed) && (s.onFieldSince === null || s.onFieldSince === undefined || num(s.onFieldSince))) &&
+    isObj(g.clock) && typeof g.clock.running === "boolean" && num(g.clock.accumulatedSeconds) &&
+    (g.clock.startedAt === null || g.clock.startedAt === undefined || num(g.clock.startedAt)) &&
+    optional(g.subLog, Array.isArray) && optional(g.possessionLog, Array.isArray) &&
+    optional(g.score, (s) => s === null || (isObj(s) && num(s.us) && num(s.them)));
+  if (!parsed.games.every(gameOk) || !uniqueIds(parsed.games)) return damaged("game list");
+
+  return {
+    data: normalizeAppData(parsed),
+    playerCount: parsed.players.length,
+    gameCount: parsed.games.length,
+    exportedAt: typeof parsed.exportedAt === "string" ? parsed.exportedAt : null,
+  };
+}
+
 /* ---------------------------- UI atoms ---------------------------- */
 
 const colors = {
@@ -545,10 +661,10 @@ function GlobalStyle() {
       .td-scroll::-webkit-scrollbar { height: 6px; width: 6px; }
       .td-scroll::-webkit-scrollbar-thumb { background: ${colors.goldDim}; border-radius: 3px; }
       select.td-select { -webkit-appearance: none; appearance: none; }
-      input.td-input, select.td-select {
+      input.td-input, select.td-select, textarea.td-input {
         background: ${colors.chalk}; color: #111111; border: 1px solid ${colors.line};
       }
-      input.td-input::placeholder { color: #6b6f63; }
+      input.td-input::placeholder, textarea.td-input::placeholder { color: #6b6f63; }
       button:focus-visible, input:focus-visible, select:focus-visible {
         outline: 2px solid ${colors.gold}; outline-offset: 1px;
       }
@@ -686,14 +802,29 @@ function ScoreModal({ title, body, confirmLabel, initialUs, initialThem, onConfi
    Clipboard API and programmatic file downloads are both unavailable —
    which is the case in some sandboxed hosts. No download attempt here on
    purpose: that path is exactly what silently failed before. */
-function ExportModal({ csv, filename, onClose }) {
+function ExportModal({ csv, filename, onClose, title = "Export roster", downloadType = null }) {
   const textareaRef = useRef(null);
   const [copyStatus, setCopyStatus] = useState("idle"); // idle | copied | failed
+  const [downloadUrl, setDownloadUrl] = useState(null);
 
   useEffect(() => {
     const t = textareaRef.current;
     if (t) { t.focus(); t.select(); }
   }, []);
+
+  // A plain link the coach taps themselves — never a scripted click — and only
+  // where saving a file is known to work (a normal browser tab).
+  useEffect(() => {
+    if (!downloadType || !storage.canSaveFiles()) return undefined;
+    let url = null;
+    try {
+      url = URL.createObjectURL(new Blob([csv], { type: downloadType }));
+      setDownloadUrl(url);
+    } catch (e) {
+      // copy/paste still works
+    }
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [csv, downloadType]);
 
   const handleCopy = async () => {
     try {
@@ -707,7 +838,7 @@ function ExportModal({ csv, filename, onClose }) {
   };
 
   return (
-    <Modal title="Export roster" onClose={onClose}>
+    <Modal title={title} onClose={onClose}>
       <div className="text-sm mb-3" style={{ color: colors.chalkMuted }}>
         The text below is already selected — press <strong style={{ color: colors.chalk }}>Ctrl/Cmd+C</strong> to
         copy it, then paste into a new file and save it as <strong style={{ color: colors.chalk }}>{filename}</strong>.
@@ -733,6 +864,127 @@ function ExportModal({ csv, filename, onClose }) {
           Automatic copy isn't available here — the text above is selected, so Ctrl/Cmd+C will still work.
         </div>
       )}
+      {downloadUrl && (
+        <a
+          href={downloadUrl}
+          download={filename}
+          className="td-display w-full py-2.5 mt-2 uppercase text-sm flex items-center justify-center gap-2"
+          style={{ border: `1px solid ${colors.gold}`, color: colors.gold, letterSpacing: "0.05em" }}
+        >
+          <Download size={15} /> Save as file
+        </a>
+      )}
+    </Modal>
+  );
+}
+
+/* Whole-app backup: export everything as one JSON text, or replace everything
+   from a backup (file or pasted text). Restoring always shows what is about
+   to be replaced and needs an explicit confirmation. */
+function BackupModal({ getSnapshot, onRestore, onClose }) {
+  const [view, setView] = useState("menu"); // menu | export | confirm
+  const [exportData, setExportData] = useState(null); // { json, filename }
+  const [pasted, setPasted] = useState("");
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(null); // parsed backup awaiting confirmation
+  const fileInputRef = useRef(null);
+  const current = getSnapshot();
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  const review = (text) => {
+    const result = parseBackupJSON(text);
+    if (result.error) { setError(result.error); return; }
+    setError("");
+    setPending(result);
+    setView("confirm");
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => review(String(reader.result || ""));
+    reader.onerror = () => setError("Couldn't read that file.");
+    reader.readAsText(file);
+  };
+
+  if (view === "export" && exportData) {
+    return (
+      <ExportModal
+        title="Export backup"
+        csv={exportData.json}
+        filename={exportData.filename}
+        downloadType="application/json"
+        onClose={onClose}
+      />
+    );
+  }
+
+  if (view === "confirm" && pending) {
+    const exported = pending.exportedAt && !Number.isNaN(Date.parse(pending.exportedAt))
+      ? ` saved on ${new Date(pending.exportedAt).toLocaleString()}`
+      : "";
+    return (
+      <ConfirmModal
+        title="Replace all data?"
+        body={`This backup${exported} has ${plural(pending.playerCount, "player")} and ${plural(pending.gameCount, "game")}. Restoring it replaces everything here now — ${plural(current.players.length, "player")} and ${plural(current.games.length, "game")} — and can't be undone.`}
+        confirmLabel="Replace"
+        onCancel={() => { setPending(null); setView("menu"); }}
+        onConfirm={() => { onRestore(pending.data); onClose(); }}
+      />
+    );
+  }
+
+  return (
+    <Modal title="Backup" onClose={onClose}>
+      <div className="text-sm mb-3" style={{ color: colors.chalkMuted }}>
+        A backup holds everything: roster, positions and every game. Use it to move to another device or to recover later.
+      </div>
+      <button
+        onClick={() => {
+          const now = Date.now();
+          setExportData({
+            json: buildBackupJSON(current, now),
+            filename: `balls-deep-backup-${new Date(now).toISOString().slice(0, 10)}.json`,
+          });
+          setView("export");
+        }}
+        className="td-display w-full py-2.5 uppercase text-sm flex items-center justify-center gap-2"
+        style={{ background: colors.gold, color: colors.bg, letterSpacing: "0.05em" }}
+      >
+        <Download size={15} /> Export backup
+      </button>
+
+      <div className="td-display text-xs uppercase mt-5 mb-2" style={{ color: colors.chalkMuted, letterSpacing: "0.08em" }}>Restore</div>
+      <button
+        onClick={() => fileInputRef.current && fileInputRef.current.click()}
+        className="td-display w-full py-2.5 uppercase text-sm flex items-center justify-center gap-2"
+        style={{ border: `1px solid ${colors.gold}`, color: colors.gold, letterSpacing: "0.05em" }}
+      >
+        <Upload size={15} /> Choose backup file
+      </button>
+      <input ref={fileInputRef} type="file" accept=".json,application/json,text/plain" className="hidden" onChange={handleFileChange} />
+
+      <div className="text-xs mt-3 mb-1" style={{ color: colors.chalkMuted }}>Or paste the backup text:</div>
+      <textarea
+        value={pasted}
+        onChange={(e) => { setPasted(e.target.value); setError(""); }}
+        rows={4}
+        placeholder="Paste backup text here"
+        aria-label="Backup text"
+        className="td-input w-full px-2 py-2 text-xs mb-2"
+        style={{ fontFamily: "monospace", resize: "vertical" }}
+      />
+      <button
+        onClick={() => review(pasted)}
+        disabled={!pasted.trim()}
+        className="td-display w-full py-2.5 uppercase text-sm"
+        style={{ border: `1px solid ${colors.line}`, color: colors.chalk, letterSpacing: "0.05em" }}
+      >
+        Restore from pasted text
+      </button>
+      {error && <div className="text-xs mt-2" style={{ color: colors.brick }}>{error}</div>}
     </Modal>
   );
 }
@@ -1674,6 +1926,14 @@ const storage = {
     window.localStorage.setItem(key, value);
     return { key, value };
   },
+  /* True only in a normal browser tab. The Claude artifact sandbox and the
+     Android WebView both ignore download links, so they stay copy/paste. */
+  canSaveFiles() {
+    if (typeof window === "undefined" || window.storage) return false;
+    const cap = window.Capacitor;
+    if (cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform()) return false;
+    return typeof Blob !== "undefined" && typeof URL !== "undefined" && typeof URL.createObjectURL === "function";
+  },
 };
 
 const TABS = [
@@ -1694,6 +1954,7 @@ export default function App() {
   const [currentGameId, setCurrentGameId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saveError, setSaveError] = useState(false);
+  const [backupOpen, setBackupOpen] = useState(false);
   const stateRef = useRef({
     players: [],
     offensePositions: DEFAULT_OFFENSE_POSITIONS,
@@ -1709,27 +1970,7 @@ export default function App() {
         const res = await storage.get("app-data");
         if (res && res.value) {
           const parsed = JSON.parse(res.value);
-          const next = {
-            players: parsed.players || [],
-            offensePositions: parsed.offensePositions && parsed.offensePositions.length ? parsed.offensePositions : DEFAULT_OFFENSE_POSITIONS,
-            defensePositions: parsed.defensePositions && parsed.defensePositions.length ? parsed.defensePositions : DEFAULT_DEFENSE_POSITIONS,
-            kickoffPositions: parsed.kickoffPositions && parsed.kickoffPositions.length ? parsed.kickoffPositions : DEFAULT_KICKOFF_POSITIONS,
-            puntPositions: parsed.puntPositions && parsed.puntPositions.length ? parsed.puntPositions : DEFAULT_PUNT_POSITIONS,
-            games: (parsed.games || []).map((g) => ({
-              // Backfill fields for games saved before kickoff/punt, quarter-clock,
-              // substitution-log, possession-tracking, or final-score support existed.
-              quarterMinutes: 10,
-              quarterStartElapsed: 0,
-              currentUnit: "offense",
-              kickoffLineup: emptyLineup(DEFAULT_KICKOFF_POSITIONS),
-              puntLineup: emptyLineup(DEFAULT_PUNT_POSITIONS),
-              subLog: [],
-              possessionLog: [],
-              currentSessionStart: 0,
-              score: null,
-              ...g,
-            })),
-          };
+          const next = normalizeAppData(parsed);
           stateRef.current = next;
           setPlayers(next.players);
           setOffensePositions(next.offensePositions);
@@ -1748,7 +1989,7 @@ export default function App() {
 
   const persist = useCallback(async (snapshot) => {
     try {
-      const result = await storage.set("app-data", JSON.stringify(snapshot));
+      const result = await storage.set("app-data", JSON.stringify({ version: DATA_VERSION, ...snapshot }));
       setSaveError(!result);
     } catch (e) {
       setSaveError(true);
@@ -1849,6 +2090,11 @@ export default function App() {
     if (currentGameId === id) setCurrentGameId(null);
   };
 
+  const restoreBackup = (data) => {
+    setCurrentGameId(null);
+    commit(data);
+  };
+
   const positionsByUnit = { offense: offensePositions, defense: defensePositions, kickoff: kickoffPositions, punt: puntPositions };
 
   if (loading) {
@@ -1864,8 +2110,15 @@ export default function App() {
     <div className="td-root flex flex-col" style={{ background: colors.bg, minHeight: 600 }}>
       <GlobalStyle />
       <div className="px-4 pt-4 pb-3 sticky top-0 z-10" style={{ background: colors.bg, borderBottom: `2px solid ${colors.gold}` }}>
-        <div className="td-display text-2xl uppercase" style={{ color: colors.chalk, letterSpacing: "0.04em" }}>Balls Deep</div>
-        <div className="text-xs" style={{ color: colors.chalkMuted }}>Roster &amp; live playtime manager</div>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="td-display text-2xl uppercase" style={{ color: colors.chalk, letterSpacing: "0.04em" }}>Balls Deep</div>
+            <div className="text-xs" style={{ color: colors.chalkMuted }}>Roster &amp; live playtime manager</div>
+          </div>
+          <button onClick={() => setBackupOpen(true)} className="flex items-center gap-1.5 td-display text-xs uppercase px-3 py-2" style={{ border: `1px solid ${colors.line}`, color: colors.chalkMuted, letterSpacing: "0.05em" }}>
+            <Download size={14} /> Backup
+          </button>
+        </div>
         {saveError && <div className="text-xs mt-1 flex items-center gap-1" style={{ color: colors.brick }}><AlertCircle size={12} /> Couldn't save changes — try again.</div>}
       </div>
 
@@ -1902,6 +2155,10 @@ export default function App() {
         )}
         {tab === "history" && <HistoryTab players={players} games={games} />}
       </div>
+
+      {backupOpen && (
+        <BackupModal getSnapshot={() => stateRef.current} onRestore={restoreBackup} onClose={() => setBackupOpen(false)} />
+      )}
 
       <div className="fixed bottom-0 left-0 right-0 flex justify-around py-2" style={{ background: colors.panel, borderTop: `1px solid ${colors.line}` }}>
         {TABS.map((t) => {

@@ -9,7 +9,8 @@ substitution suggestions — is identical.
 
 Data is saved locally in whichever browser (or Android WebView) you run it
 in. It does **not** sync with the version inside your Claude conversation —
-they're separate copies of the app with separate saved data.
+they're separate copies of the app with separate saved data. Use the
+**Backup** button to carry data from one to the other.
 
 ## Screenshots
 
@@ -118,6 +119,12 @@ time — that's normal for an app that isn't on the Play Store).
 
 `localStorage` inside an Android WebView is sandboxed per-app, so your
 roster and games will stay put across sessions on that phone. It won't
-transfer automatically if you reinstall the app or switch phones — for that
-you'd want to add a proper export/import (or cloud sync) feature, which is a
-reasonable next step once you're using the Android build day to day.
+transfer automatically if you reinstall the app or switch phones.
+
+To protect or move your data, use the **Backup** button at the top of the
+app. **Export backup** gives you everything (roster, positions, every game)
+as one piece of text to copy somewhere safe; in a normal desktop browser it
+also offers **Save as file**. To restore, choose the backup file or paste the
+text. Restoring replaces everything on that device, and the app shows what
+will be replaced and asks you to confirm first. The same backup moves data
+between the version inside Claude, the browser version and the phone.
