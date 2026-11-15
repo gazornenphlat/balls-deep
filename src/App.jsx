@@ -30,7 +30,8 @@ import {
    - Game clock: a free-running stopwatch for the whole game (used for total
      playtime accounting) — unaffected by quarter changes.
    - Quarter clock: counts down from `quarterMinutes`, reset whenever the
-     quarter is bumped. Purely a display/pacing aid; doesn't gate anything.
+     quarter is bumped. When it runs out, the game clock auto-pauses (the
+     player still has to hit Play again to resume).
 ------------------------------------------------------------------*/
 
 const UNIT_DEFS = [
@@ -70,7 +71,7 @@ const DEFAULT_PUNT_POSITIONS = [
   { name: "PROT", slots: 4 },
 ];
 
-const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const uid = () => (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2, 10) + Date.now().toString(36));
 
 function formatDuration(totalSeconds) {
   const s = Math.max(0, Math.round(totalSeconds));
@@ -533,7 +534,7 @@ const BACKUP_APP_ID = "balls-deep";
 /* Turns whatever was saved (any older version) into the current shape.
    Used for both the normal load path and restoring a backup. */
 function normalizeAppData(parsed) {
-  const listOr = (list, fallback) => (Array.isArray(list) && list.length ? list : fallback);
+  const listOr = (list, fallback) => (Array.isArray(list) ? list : fallback);
   return {
     players: Array.isArray(parsed.players) ? parsed.players : [],
     offensePositions: listOr(parsed.offensePositions, DEFAULT_OFFENSE_POSITIONS),
@@ -626,7 +627,7 @@ function parseBackupJSON(text) {
     isObj(g.clock) && typeof g.clock.running === "boolean" && num(g.clock.accumulatedSeconds) &&
     (g.clock.startedAt === null || g.clock.startedAt === undefined || num(g.clock.startedAt)) &&
     optional(g.subLog, Array.isArray) && optional(g.possessionLog, Array.isArray) &&
-    optional(g.score, (s) => s === null || (isObj(s) && num(s.us) && num(s.them)));
+    optional(g.score, (s) => s === null || (isObj(s) && (s.us === null || num(s.us)) && (s.them === null || num(s.them))));
   if (!parsed.games.every(gameOk) || !uniqueIds(parsed.games)) return damaged("game list");
 
   return {
@@ -1954,6 +1955,7 @@ export default function App() {
   const [currentGameId, setCurrentGameId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saveError, setSaveError] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [backupOpen, setBackupOpen] = useState(false);
   const stateRef = useRef({
     players: [],
@@ -1966,9 +1968,13 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
+      // True once stored data was found, so a failure after this point
+      // means the save is damaged — not "no saved data yet".
+      let hadStoredData = false;
       try {
         const res = await storage.get("app-data");
         if (res && res.value) {
+          hadStoredData = true;
           const parsed = JSON.parse(res.value);
           const next = normalizeAppData(parsed);
           stateRef.current = next;
@@ -1980,7 +1986,9 @@ export default function App() {
           setGames(next.games);
         }
       } catch (e) {
-        // no saved data yet — defaults stand
+        // No saved data yet — defaults stand. But if data was there and
+        // couldn't be read, say so instead of silently starting empty.
+        if (hadStoredData) setLoadError(true);
       } finally {
         setLoading(false);
       }
@@ -2120,6 +2128,7 @@ export default function App() {
           </button>
         </div>
         {saveError && <div className="text-xs mt-1 flex items-center gap-1" style={{ color: colors.brick }}><AlertCircle size={12} /> Couldn't save changes — try again.</div>}
+        {loadError && <div className="text-xs mt-1 flex items-center gap-1" style={{ color: colors.brick }}><AlertCircle size={12} /> Saved data couldn't be read — it may be damaged. Restore from a backup to get it back.</div>}
       </div>
 
       <div className="flex-1">
